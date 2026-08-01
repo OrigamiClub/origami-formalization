@@ -12,14 +12,17 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from origami_api import OrigamiAPI
+
 ROOT_DIR = Path(__file__).resolve().parent
 WEB_DIR = ROOT_DIR / "origami-sim" / "web"
 DATA_DIR = ROOT_DIR / "data"
 LEAN_SCRIPT = ROOT_DIR / "Origami" / "FOLD_verification" / "FOLD_2_lean.py"
-LEAN_OUTPUT = ROOT_DIR / "Origami" / "FOLD_verification" / "parsed.lean"
+LEAN_OUTPUT = ROOT_DIR / "Origami" / "FOLD_verification" / "generated.lean"
 
 JOBS = {}
 JOBS_LOCK = threading.Lock()
+ORIGAMI_API = OrigamiAPI()
 
 
 def _safe_stem(value: str) -> str:
@@ -33,6 +36,12 @@ class OrigamiHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         _log(f"POST {self.path}")
+        if self.path == "/add-axiom":
+            self._handle_add_axiom()
+            return
+        if self.path == "/build-lean":
+            self._handle_build_lean()
+            return
         if self.path == "/export-fold":
             self._handle_export_fold()
             return
@@ -47,6 +56,52 @@ class OrigamiHandler(SimpleHTTPRequestHandler):
             self._handle_run_lean_status()
             return
         super().do_GET()
+
+    def _handle_add_axiom(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length) if length > 0 else b""
+        try:
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            self.send_error(400, "Invalid JSON")
+            return
+
+        axiom_type = payload.get("type")
+        params = payload.get("params")
+        if axiom_type is None or params is None:
+            self.send_error(400, "Missing 'type' or 'params'")
+            return
+
+        try:
+            ORIGAMI_API.add_axiom(axiom_type, params)
+        except ValueError as e:
+            self.send_error(400, str(e))
+            return
+
+        self._send_json(200, {"status": "axiom added"})
+
+    def _handle_build_lean(self):
+        ORIGAMI_API.write_lean_file(LEAN_OUTPUT)
+        _log(f"Generated Lean file at {LEAN_OUTPUT}")
+
+        job_id = uuid.uuid4().hex
+        with JOBS_LOCK:
+            JOBS[job_id] = {
+                "status": "queued",
+                "step": "queued",
+                "success": False,
+                "log": "",
+                "error": "",
+            }
+
+        thread = threading.Thread(
+            target=_run_lean_job,
+            args=(job_id, LEAN_OUTPUT),
+            daemon=True,
+        )
+        thread.start()
+
+        self._send_json(200, {"job_id": job_id})
 
     def _handle_export_fold(self):
         length = int(self.headers.get("Content-Length", "0"))
@@ -66,6 +121,7 @@ class OrigamiHandler(SimpleHTTPRequestHandler):
         filename = f"{_safe_stem(title)}.fold"
 
         DATA_DIR.mkdir(parents=True, exist_ok=True)
+
         out_path = DATA_DIR / filename
         with out_path.open("w", encoding="utf-8") as handle:
             json.dump(fold, handle, indent=2, ensure_ascii=True)
@@ -119,7 +175,7 @@ class OrigamiHandler(SimpleHTTPRequestHandler):
             }
 
         thread = threading.Thread(
-            target=_run_lean_job,
+            target=_run_lean_job_from_fold,
             args=(job_id, fold_path),
             daemon=True,
         )
@@ -172,7 +228,7 @@ def _run_command(cmd, cwd: Path) -> subprocess.CompletedProcess:
     )
 
 
-def _run_lean_job(job_id: str, fold_path: Path) -> None:
+def _run_lean_job_from_fold(job_id: str, fold_path: Path) -> None:
     _update_job(job_id, status="running", step="convert", log="", error="")
 
     if not LEAN_SCRIPT.is_file():
@@ -200,14 +256,18 @@ def _run_lean_job(job_id: str, fold_path: Path) -> None:
         )
         return
 
-    _update_job(job_id, step="compile")
+    _run_lean_job(job_id, LEAN_OUTPUT)
+
+
+def _run_lean_job(job_id: str, lean_file: Path) -> None:
+    _update_job(job_id, status="running", step="compile")
     lake = shutil.which("lake")
     if not lake:
         _update_job(job_id, status="done", step="compile", error="lake not found in PATH")
         return
 
     compile_run = _run_command(
-        [lake, "env", "lean", str(LEAN_OUTPUT)],
+        [lake, "env", "lean", str(lean_file)],
         cwd=ROOT_DIR,
     )
     if compile_run.returncode != 0:
@@ -238,6 +298,8 @@ def main() -> int:
 
     server = ThreadingHTTPServer(("", args.port), OrigamiHandler)
     _log(f"Serving {WEB_DIR} at http://localhost:{args.port}")
+    _log(f"Axiom endpoint: http://localhost:{args.port}/add-axiom")
+    _log(f"Build endpoint: http://localhost:{args.port}/build-lean")
     _log(f"Export endpoint: http://localhost:{args.port}/export-fold")
     _log(f"Lean endpoint: http://localhost:{args.port}/run-lean")
     server.serve_forever()
@@ -246,4 +308,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
