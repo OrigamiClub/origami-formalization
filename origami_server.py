@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 import argparse
 import json
-import re
 import shutil
 import subprocess
 import threading
 import uuid
-import sys
 from datetime import datetime
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -16,18 +14,11 @@ from origami_api import OrigamiAPI
 
 ROOT_DIR = Path(__file__).resolve().parent
 WEB_DIR = ROOT_DIR / "origami-sim" / "web"
-DATA_DIR = ROOT_DIR / "data"
-LEAN_SCRIPT = ROOT_DIR / "Origami" / "FOLD_verification" / "FOLD_2_lean.py"
-LEAN_OUTPUT = ROOT_DIR / "Origami" / "FOLD_verification" / "generated.lean"
+LEAN_OUTPUT = ROOT_DIR / "Origami" / "generated" / "construction.lean"
 
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 ORIGAMI_API = OrigamiAPI()
-
-
-def _safe_stem(value: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._")
-    return cleaned or "pattern"
 
 
 class OrigamiHandler(SimpleHTTPRequestHandler):
@@ -39,21 +30,24 @@ class OrigamiHandler(SimpleHTTPRequestHandler):
         if self.path == "/add-axiom":
             self._handle_add_axiom()
             return
+        if self.path == "/undo-axiom":
+            self._handle_undo_axiom()
+            return
+        if self.path == "/clear-axioms":
+            self._handle_clear_axioms()
+            return
         if self.path == "/build-lean":
             self._handle_build_lean()
-            return
-        if self.path == "/export-fold":
-            self._handle_export_fold()
-            return
-        if self.path == "/run-lean":
-            self._handle_run_lean()
             return
         self.send_error(404, "Not Found")
 
     def do_GET(self):
         _log(f"GET {self.path}")
-        if self.path.startswith("/run-lean/status"):
-            self._handle_run_lean_status()
+        if self.path.startswith("/build-lean/status"):
+            self._handle_build_lean_status()
+            return
+        if self.path == "/axioms":
+            self._handle_get_axioms()
             return
         super().do_GET()
 
@@ -73,12 +67,34 @@ class OrigamiHandler(SimpleHTTPRequestHandler):
             return
 
         try:
-            ORIGAMI_API.add_axiom(axiom_type, params)
+            axiom_summary = ORIGAMI_API.add_axiom(axiom_type, params)
         except ValueError as e:
             self.send_error(400, str(e))
             return
 
-        self._send_json(200, {"status": "axiom added"})
+        _log(f"Axiom {axiom_type} added (stack size {len(ORIGAMI_API.axioms)})")
+        self._send_json(
+            200,
+            {
+                "status": "axiom added",
+                "axiom": axiom_summary,
+                "stack": ORIGAMI_API.describe_stack(),
+            },
+        )
+
+    def _handle_undo_axiom(self):
+        removed = ORIGAMI_API.undo()
+        self._send_json(
+            200,
+            {"status": "undone" if removed else "empty", "stack": ORIGAMI_API.describe_stack()},
+        )
+
+    def _handle_clear_axioms(self):
+        ORIGAMI_API.clear()
+        self._send_json(200, {"status": "cleared", "stack": ORIGAMI_API.describe_stack()})
+
+    def _handle_get_axioms(self):
+        self._send_json(200, ORIGAMI_API.describe_stack())
 
     def _handle_build_lean(self):
         ORIGAMI_API.write_lean_file(LEAN_OUTPUT)
@@ -103,87 +119,7 @@ class OrigamiHandler(SimpleHTTPRequestHandler):
 
         self._send_json(200, {"job_id": job_id})
 
-    def _handle_export_fold(self):
-        length = int(self.headers.get("Content-Length", "0"))
-        raw = self.rfile.read(length) if length > 0 else b""
-        try:
-            payload = json.loads(raw.decode("utf-8") or "{}")
-        except json.JSONDecodeError:
-            self.send_error(400, "Invalid JSON")
-            return
-
-        fold = payload.get("fold")
-        if fold is None:
-            self.send_error(400, "Missing 'fold' payload")
-            return
-
-        title = str(payload.get("title") or "pattern")
-        filename = f"{_safe_stem(title)}.fold"
-
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-        out_path = DATA_DIR / filename
-        with out_path.open("w", encoding="utf-8") as handle:
-            json.dump(fold, handle, indent=2, ensure_ascii=True)
-        _log(f"Saved FOLD to {out_path}")
-
-        response = {
-            "saved": True,
-            "filename": filename,
-            "path": str(out_path),
-        }
-        self._send_json(200, response)
-
-    def _handle_run_lean(self):
-        length = int(self.headers.get("Content-Length", "0"))
-        raw = self.rfile.read(length) if length > 0 else b""
-        try:
-            payload = json.loads(raw.decode("utf-8") or "{}")
-        except json.JSONDecodeError:
-            self.send_error(400, "Invalid JSON")
-            return
-
-        fold_payload = payload.get("fold")
-        title = str(payload.get("title") or "pattern")
-        filename = payload.get("filename")
-
-        if fold_payload is not None:
-            filename = f"{_safe_stem(title)}.fold"
-            DATA_DIR.mkdir(parents=True, exist_ok=True)
-            out_path = DATA_DIR / filename
-            with out_path.open("w", encoding="utf-8") as handle:
-                json.dump(fold_payload, handle, indent=2, ensure_ascii=True)
-            _log(f"Saved FOLD to {out_path} (pre-check export)")
-        elif not filename:
-            self.send_error(400, "Missing 'filename' or 'fold'")
-            return
-
-        fold_path = DATA_DIR / filename
-        if not fold_path.is_file():
-            self.send_error(404, f"FOLD file not found: {filename}")
-            return
-        _log(f"Lean job requested for {fold_path}")
-
-        job_id = uuid.uuid4().hex
-        with JOBS_LOCK:
-            JOBS[job_id] = {
-                "status": "queued",
-                "step": "queued",
-                "success": False,
-                "log": "",
-                "error": "",
-            }
-
-        thread = threading.Thread(
-            target=_run_lean_job_from_fold,
-            args=(job_id, fold_path),
-            daemon=True,
-        )
-        thread.start()
-
-        self._send_json(200, {"job_id": job_id, "filename": filename})
-
-    def _handle_run_lean_status(self):
+    def _handle_build_lean_status(self):
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
         job_id = params.get("job_id", [""])[0]
@@ -228,37 +164,6 @@ def _run_command(cmd, cwd: Path) -> subprocess.CompletedProcess:
     )
 
 
-def _run_lean_job_from_fold(job_id: str, fold_path: Path) -> None:
-    _update_job(job_id, status="running", step="convert", log="", error="")
-
-    if not LEAN_SCRIPT.is_file():
-        _update_job(job_id, status="done", step="convert", error="Lean script missing")
-        return
-
-    convert = _run_command(
-        [
-            sys.executable,
-            str(LEAN_SCRIPT),
-            "--input",
-            str(fold_path),
-            "--output",
-            str(LEAN_OUTPUT),
-        ],
-        cwd=ROOT_DIR,
-    )
-    if convert.returncode != 0:
-        _update_job(
-            job_id,
-            status="done",
-            step="convert",
-            error=convert.stderr.strip() or convert.stdout.strip() or "Conversion failed",
-            log=(convert.stdout + convert.stderr).strip(),
-        )
-        return
-
-    _run_lean_job(job_id, LEAN_OUTPUT)
-
-
 def _run_lean_job(job_id: str, lean_file: Path) -> None:
     _update_job(job_id, status="running", step="compile")
     lake = shutil.which("lake")
@@ -298,10 +203,8 @@ def main() -> int:
 
     server = ThreadingHTTPServer(("", args.port), OrigamiHandler)
     _log(f"Serving {WEB_DIR} at http://localhost:{args.port}")
-    _log(f"Axiom endpoint: http://localhost:{args.port}/add-axiom")
-    _log(f"Build endpoint: http://localhost:{args.port}/build-lean")
-    _log(f"Export endpoint: http://localhost:{args.port}/export-fold")
-    _log(f"Lean endpoint: http://localhost:{args.port}/run-lean")
+    _log(f"Axiom endpoints: /add-axiom, /undo-axiom, /clear-axioms (POST), /axioms (GET)")
+    _log(f"Build endpoints: /build-lean (POST), /build-lean/status (GET)")
     server.serve_forever()
     return 0
 

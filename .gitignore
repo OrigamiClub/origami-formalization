@@ -18,10 +18,8 @@ Origami/Geometry
 
 .vscode/
 
-Origami/FOLD_verification/parsed.lean
+Origami/generated/
 
 p.txt
 
 *.tmp
-
-Origami/FOLD/parsed.lean
